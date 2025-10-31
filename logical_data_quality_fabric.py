@@ -6,13 +6,13 @@
 # It evaluates the model using accuracy, precision, recall, F1 score, and AUC, and visualizes the confusion matrix and ROC curve.
 
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import col, lower, lit, struct, when, udf
+from pyspark.sql.functions import col, lower, lit, struct, when, udf, format_number
 from pyspark.ml.feature import VectorAssembler, StringIndexerModel
 from pyspark.ml.classification import LogisticRegression
-from pyspark.ml import Pipeline
+from pyspark.ml import Pipeline, PipelineModel
 from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
 from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, roc_curve, auc
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, StringType
 import matplotlib.pyplot as plt
 import numpy as np
 
@@ -67,18 +67,28 @@ pipeline = Pipeline(stages=[assembler, lr])
 train_df, test_df = df.randomSplit([0.7, 0.3], seed=42)
 model = pipeline.fit(train_df)
 
+# Save model after training
+model.write().overwrite().save("abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse/Files/ml_models/sythetic_customer_logistic_model")
+
 # Apply model
 predictions = model.transform(df)
 predictions = predictions.withColumn("is_real_customer", when(col("prediction") == 0, lit("Y")).otherwise(lit("N")))
 
-# Extract confidence for real class (index 0)
-extract_confidence = udf(lambda v: float(v[0]), DoubleType())
+# Extract prediction and confidence
+extract_confidence = udf(lambda v: f"{float(v[0]):.10f}", StringType())
+predictions = predictions.withColumn("is_real_customer", when(col("prediction") == 0, lit("Y")).otherwise(lit("N")))
 predictions = predictions.withColumn("confidence", extract_confidence(col("probability")))
 predictions = predictions.withColumn("real_customer_probability", struct(col("is_real_customer"), col("confidence")))
 
+# Convert confidence to score between 0.00 and 10.00
+predictions = predictions.withColumn("real_customer_score", format_number((col("confidence") * 10), 2))
+
 # Show results
-predictions.select("first_name", "last_name", "email", "phone", "date_of_birth", "address", "zip_code",
-                   "company_name", "is_real_customer", "real_customer_probability").show(truncate=False)
+display(predictions.select(
+    "first_name", "last_name", "email", "phone", "date_of_birth", "address", "zip_code",
+    "company_name", "is_real_customer", "confidence", "real_customer_score"
+))
+
 
 # Evaluate model on test set
 predictions_test = model.transform(test_df)
@@ -138,7 +148,7 @@ new_df = new_df.select(
     col("company").alias("company_name")
 )
 
-display(new_df)
+#display(new_df)
 
 # Create indicator flags
 new_df = new_df.withColumn("email_flag", when(lower(col("email")).rlike("(" + "|".join(email_indicators) + ")"), 1).otherwise(0))
@@ -155,26 +165,23 @@ new_df = new_df.withColumn("synthetic_score",
     col("email_flag") + col("phone_flag") + col("name_flag") +
     col("dob_flag") + col("address_flag") + col("zip_flag") + col("company_flag"))
 
-# Assemble features
-#assembler = VectorAssembler(
-#    inputCols=["email_flag", "phone_flag", "name_flag", "dob_flag", "address_flag", "zip_flag", "company_flag", "synthetic_score"],
-#    outputCol="features"
-#)
-#new_df = assembler.transform(new_df)
-
 # Load trained model
-# model = PipelineModel.load("path_to_saved_model")
+model = PipelineModel.load("abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse/Files/ml_models/sythetic_customer_logistic_model")
 
 # Apply model
 predictions = model.transform(new_df)
 
 # Extract prediction and confidence
-extract_confidence = udf(lambda v: float(v[0]), DoubleType())
+extract_confidence = udf(lambda v: f"{float(v[0]):.10f}", StringType())
 predictions = predictions.withColumn("is_real_customer", when(col("prediction") == 0, lit("Y")).otherwise(lit("N")))
 predictions = predictions.withColumn("confidence", extract_confidence(col("probability")))
 predictions = predictions.withColumn("real_customer_probability", struct(col("is_real_customer"), col("confidence")))
 
-# Show results
-display(predictions.select("first_name", "last_name", "email", "phone", "date_of_birth", "address", "zip_code",
-                   "company_name", "is_real_customer", "real_customer_probability"))
+# Convert confidence to score between 0.00 and 10.00
+predictions = predictions.withColumn("real_customer_score", format_number((col("confidence") * 10), 2))
 
+# Show results
+display(predictions.select(
+    "first_name", "last_name", "email", "phone", "date_of_birth", "address", "zip_code",
+    "company_name", "is_real_customer", "confidence", "real_customer_score"
+))
