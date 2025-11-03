@@ -1,86 +1,172 @@
-# COMMAND ----------
+#---------------------------------------------------------------------
+# Name: clnt_receive_data_file.ipynb
+#---------------------------------------------------------------------
+# Purpose:  Automates scanning of landing zone directories in OneLake/ADLS, 
+#           matching incoming files to expected patterns (from meta-data), 
+#           and registering new file discoveries in the data_file meta table.
+#---------------------------------------------------------------------
+# ver.  | date     | author         | change
+#---------------------------------------------------------------------
+# v1    | 10/28/25 | K. Hardis      | Initial Version.
+#---------------------------------------------------------------------
 
-# Notebook widgets for parameterization
-dbutils.widgets.text("filename", "")
-dbutils.widgets.text("record_count", "")
-dbutils.widgets.text("expected_row_count", "")
-dbutils.widgets.text("batch_name", "")
-dbutils.widgets.text("status", "")
+# Standard library
+import sys
+import fnmatch
+import os
 
-filename = dbutils.widgets.get("filename")
-record_count = dbutils.widgets.get("record_count")
-expected_row_count = dbutils.widgets.get("expected_row_count")
-batch_name = dbutils.widgets.get("batch_name") or "daily_update"
-status = dbutils.widgets.get("status") or "RECEIVED"
+# PySpark SQL functions
+from pyspark.sql.functions import current_timestamp
 
-# COMMAND ----------
-
-from pyspark.sql.functions import col, lit
+# PySpark types
 from datetime import datetime
 
-# Define paths to bronze delta tables
-data_object_path = "Tables/lk_msft_bronze.data_object"
-batch_path = "Tables/lk_msft_bronze.batch"
-data_file_path = "Tables/lk_msft_bronze.data_file"
+sys.path.append("./builtin")
 
-# COMMAND ----------
+# External Modules
+import shared_context as sc
+import opsLookupUtil as lkp
 
-# Lookup metadata for the file from data_object table
-data_object_df = spark.read.format("delta").load(data_object_path)
-data_object_info = data_object_df.filter(col("filename") == filename).limit(1).collect()
+import importlib
 
-if not data_object_info:
-    raise ValueError(f"No metadata found for filename: {filename}")
+# Force reload in case modules were cached
+importlib.reload(sc)
+importlib.reload(lkp)
 
-data_object_info = data_object_info[0]
-object_id = data_object_info["object_id"]
-object_name = data_object_info["object_name"]
-filename_pattern = data_object_info["filename_pattern"]
-landing_directory = data_object_info["landing_directory"]
-compression_type = data_object_info["compression_type"]
+# Log external module versions
+from log_module_versions import log_module_versions
+log_module_versions(["shared_context","opsLookupUtil"])
 
-# COMMAND ----------
 
-# Lookup batch_id from batch table
-batch_df = spark.read.format("delta").load(batch_path)
-batch_info = batch_df.filter(col("batch_name") == batch_name).select("batch_id").collect()
+print('||-------------clnt_receive_data_file.ipynb--------------||')
+print('||-----')
 
-if not batch_info:
-    raise ValueError(f"No active batch found for batch_name: {batch_name}")
 
-batch_id = batch_info[0]["batch_id"]
+# Create spark shared context
+ctx = sc.SparkContextWrapper(spark)
 
-# COMMAND ----------
+batch_name = 'daily_update'
+batchAttr = lkp.getActiveBatchRecordByBatchName(ctx, batch_name)
 
-# If record_count is not provided, try to infer it from the landed file
-if not record_count:
+if batchAttr is None or batchAttr.rdd.isEmpty():
+    errorMSG = 'No Records Found in BATCH! Exiting...'
+    print('|| ' + errorMSG)
+    # upd.updateProcessLog(MetaEngine, process_log_id, None, None, None, None, None, None, None, None, None, None, None, failedStr, errorMSG, None)
+    raise ValueError(errorMSG)
+else:
+    row = batchAttr.first()
+    print(f"||    batch_id: {row['batch_id']}")
+    print(f"||    batch_name: {row['batch_name']}")
+    print('||-----')
+
+# Get all file-type data objects
+data_objects_df = ctx.spark.sql("""
+    SELECT object_id, object_name, filename_pattern, landing_directory
+    FROM meta_db.data_object
+    WHERE object_type = 'file'
+""").collect()
+
+for obj in data_objects_df:
+    data_source = obj["object_name"]
+    object_id = obj["object_id"]
+    pattern = obj["filename_pattern"].replace('%', '*')
+    landing_directory = obj["landing_directory"]
+
+    full_path = f"abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse{landing_directory}"
+
+    print(f"||    Scanning path: {full_path}")
+    print(f"||    Filename pattern: {pattern}")
+    print(f"||    Processing files for data source: {data_source}")
+    print('||-----')
+
+    # Read file metadata
+    file_df = ctx.spark.read.format("binaryFile").option("recursiveFileLookup", "true").load(full_path)
+
+    # Extract and filter filenames
+    all_files = [row["path"].split("/")[-1] for row in file_df.select("path").collect()]
+    filtered_files = [f for f in all_files if fnmatch.fnmatch(f, pattern)]
+
+    # Extract and filter file paths
+    all_paths = [row["path"] for row in file_df.select("path").collect()]
+    filtered_paths = [p for p in all_paths if fnmatch.fnmatch(p.split("/")[-1], pattern)]
+
+    # Extract relative directories
+    relative_dirs = ["/Files" + os.path.dirname(p.split("/Files", 1)[-1]) for p in filtered_paths]
+
+    # Compare against metadata table
     try:
-        file_path = f"{landing_directory}/{filename}"
-        if compression_type.lower() == "gzip" and not filename.endswith(".gz"):
-            file_path += ".gz"
+        registered_df = ctx.spark.table("meta_db.data_file").select("filename")
+        registered_files = [row.filename for row in registered_df.collect()]
+    except:
+        registered_files = []
 
-        raw_df = spark.read.text(file_path)
-        record_count = raw_df.count()
-    except Exception as e:
-        print(f"WARNING: Could not determine record_count: {e}")
-        record_count = None
+    unregistered_files = [f for f in filtered_files if f not in registered_files]
+    
+    # Get unregistered file paths (directory only)
+    unregistered_file_paths = [
+        relative_dirs[i] for i, p in enumerate(filtered_paths)
+        if p.split("/")[-1] not in registered_files
+    ]
 
-# COMMAND ----------
+    # Get current max batch_id for daily_update in STARTED state
+    batch_row = ctx.spark.sql("""
+        SELECT COALESCE(MAX(batch_id), 0) AS max_id
+        FROM meta_db.BATCH
+        WHERE batch_name = 'daily_update' AND batch_status = 'STARTED'
+    """).first()
+    current_batch_id = batch_row["max_id"]
 
-# Create a new record for the data_file table
-new_data_file_df = spark.createDataFrame([{
-    "batch_id": batch_id,
-    "filename": filename,
-    "object_id": object_id,
-    "filename_pattern": filename_pattern,
-    "status": status,
-    "expected_row_count": expected_row_count,
-    "record_count": record_count,
-    "landing_directory": landing_directory,
-    "created_at": datetime.now()
-}])
+    # Get current max file_id
+    try:
+        file_id_row = ctx.spark.sql("SELECT COALESCE(MAX(file_id), 0) AS max_id FROM meta_db.data_file").first()
+        next_file_id = file_id_row["max_id"] + 1
+    except:
+        next_file_id = 1
 
-new_data_file_df.write.format("delta").mode("append").save(data_file_path)
+        file_id = file_row.file_id
+        filename = file_row.filename
+        object_id = file_row.object_id
+        source_id = file_row.object_id
+        batch_id = file_row.batch_id
+        landing_directory = file_row.file_path
 
-# COMMAND ----------
+    if unregistered_files:
+        now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        for i, filename in enumerate(unregistered_files):
+            file_path = unregistered_file_paths[i]  # Match index to filename
+            ctx.spark.sql(f"""
+                INSERT INTO meta_db.data_file
+                VALUES (
+                    {next_file_id + i},    -- file_id
+                    {object_id},           -- object_id
+                    NULL,                  -- file_pattern
+                    NULL,                  -- file_date
+                    TIMESTAMP('{now_ts}'), -- file_received_date
+                    'REGISTERED',          -- file_status
+                    NULL,                  -- file_byte_size
+                    '{filename}',          -- filename
+                    NULL,                  -- expected_row_count
+                    NULL,                  -- row_count
+                    NULL,                  -- fm_file_id
+                    NULL,                  -- fm_good_record_count
+                    NULL,                  -- fm_error_record_count
+                    NULL,                  -- stg_good_record_count
+                    '{file_path}',         -- file_path
+                    {current_batch_id},    -- batch_id
+                    TIMESTAMP('{now_ts}'), -- created_date
+                    'system',              -- created_by
+                    TIMESTAMP('{now_ts}'), -- modified_date
+                    'system'               -- modified_by
+                )
+            """)
+        print(f"||    Registered {len(unregistered_files)} new files:")
+        for i, filename in enumerate(unregistered_files):
+            file_id = next_file_id + i
+            print(f"||        [file_id: {file_id}] {filename}")
+    else:
+        print("||    No new files to register.")
 
+    print('||-----')
+
+print('||----------------SUCCESS----------------||')
+print('||-----')
