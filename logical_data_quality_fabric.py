@@ -68,7 +68,7 @@ train_df, test_df = df.randomSplit([0.7, 0.3], seed=42)
 model = pipeline.fit(train_df)
 
 # Save model after training
-model.write().overwrite().save("abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse/Files/ml_models/sythetic_customer_logistic_model")
+model.write().overwrite().save("abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse/Files/ml_models/synthetic_customer_logistic_model")
 
 # Apply model
 predictions = model.transform(df)
@@ -166,7 +166,7 @@ new_df = new_df.withColumn("synthetic_score",
     col("dob_flag") + col("address_flag") + col("zip_flag") + col("company_flag"))
 
 # Load trained model
-model = PipelineModel.load("abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse/Files/ml_models/sythetic_customer_logistic_model")
+model = PipelineModel.load("abfss://CDSA@onelake.dfs.fabric.microsoft.com/lk_cdsa_landing_zone.Lakehouse/Files/ml_models/synthetic_customer_logistic_model")
 
 # Apply model
 predictions = model.transform(new_df)
