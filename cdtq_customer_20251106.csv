@@ -1,0 +1,4 @@
+"customer_id","first_name","last_name","street_address","city","state_prov","postal","company","job","email","random_number","guid","ipv4","phone","dob","origin"
+"1","John","Thomas","27697 Chandler Fall","Reneefort","Kentucky","87147",""Robinson"," Clay and Santiago"","Immigration officer","smithkrista@example.org","92511610","532ab8cb-5f96-4afd-b04a-03a9c29f83df","181.224.12.56","424.975.7291","1953-09-09","faker.factory"
+"2","Alejandra","Taylor","05767 Hernandez Tunnel Apt. 436","Benjamintown","Maryland","55591","Mccoy Inc","Theme park manager","jamescooper@example.org","5240333","bba0304e-cf5b-4e24-8dc2-52b5d264ada3","61.7.42.173","627.276.5470","1933-04-04","faker.factory"
+"999","tstfn","tstln","123 Oak St","Anywhere","New Jersey","12345","tst Inc.","Business Systems Analyst","tstt@test.com","3233","5e235249-dec1-953a-668c-de1248424100","197.10.33.121","411","1900-01-01","test.data"
